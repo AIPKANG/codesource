@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # 학교 공용 서버 배포(서버 배포 설명서 10-08): GitHub Actions가 이미지 파일과 함께 이 스크립트를 서버로 보내 실행한다.
 # - DB는 Crowfoot PostgreSQL(밖), Nginx는 서버 공용 Nginx(~/nginx/<도메인>.conf → APP_PORT)
-# - 이 스크립트는 우리 것만 띄운다: Redis 컨테이너 + 앱 컨테이너(APP_PORT로만 열림), 사진은 Docker 볼륨
+# - 이 스크립트는 우리 것만 띄운다: Redis 컨테이너 + 프록시(nginx, APP_PORT로만 열림) + 앱 컨테이너, 사진은 Docker 볼륨
+# - 무중단 교체(1.15.0): 앱은 blue·green 두 이름을 번갈아 쓴다. 새 앱이 정상(health)일 때만 프록시를 새 앱으로 넘기고
+#   옛 앱을 끈다. 새 앱이 안 켜지면 새 앱만 지우고 옛 앱이 계속 서비스한다(사이트는 꺼지지 않음).
+#   DB 마이그레이션은 새 앱이 켜질 때 적용되므로 옛 앱과 같이 돌 수 있게 "추가만" 한다(개인 확장 규칙과 같음).
 # - 비밀값은 Actions가 환경 변수로 넘겨주고, 서버에는 0600 권한 env 파일로만 남긴다(다시 시작할 때 필요)
 # 필요한 환경 변수: APP_PORT APP_DOMAIN DB_ADDRESS DB_PORT DB_NAME DB_USERNAME DB_PASSWORD DB_SCHEMA
 #   MAIL_USERNAME MAIL_PASSWORD GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET
@@ -13,7 +16,9 @@ WORK="${HOME}/${APP_NAME}"
 IMAGE_TAR="${WORK}/image.tar.gz"
 NET="${APP_NAME}-net"
 REDIS="${APP_NAME}-redis"
-APP="${APP_NAME}-app"
+PROXY="${APP_NAME}-proxy"
+PROXY_IMAGE="nginx:1.28-alpine"
+LEGACY_APP="${APP_NAME}-app" # 1.14.x까지: 앱이 APP_PORT를 직접 열던 컨테이너(처음 옮길 때 한 번 지움)
 
 for v in APP_PORT APP_DOMAIN DB_ADDRESS DB_PORT DB_NAME DB_USERNAME DB_PASSWORD DB_SCHEMA \
          MAIL_USERNAME MAIL_PASSWORD GOOGLE_CLIENT_ID GOOGLE_CLIENT_SECRET GITHUB_CLIENT_ID GITHUB_CLIENT_SECRET; do
@@ -74,22 +79,85 @@ if ! ${DOCKER} ps --format '{{.Names}}' | grep -qx "${REDIS}"; then
     redis:8 redis-server --appendonly yes > /dev/null
 fi
 
-echo "== 앱 교체"
-${DOCKER} rm -f "${APP}" > /dev/null 2>&1 || true
-${DOCKER} run -d --name "${APP}" --network "${NET}" --restart unless-stopped \
-  -p "${APP_PORT}:8080" --env-file "${ENV_FILE}" \
-  -v "${APP_NAME}-data:/app/data" --log-opt max-size=20m --log-opt max-file=5 \
+# 지금 서비스 중인 색은 프록시 설정에서 읽는다(설정이 곧 사실)
+CONF_DIR="${WORK}/proxy"
+ACTIVE="$(grep -oE 'app-(blue|green):8080' "${CONF_DIR}/default.conf" 2>/dev/null | head -1 | cut -d- -f2 | cut -d: -f1 || true)"
+if [ "${ACTIVE}" = "blue" ]; then NEXT="green"; else NEXT="blue"; fi
+NEW_APP="${APP_NAME}-app-${NEXT}"
+
+echo "== 새 앱(${NEXT}) 켜기"
+${DOCKER} rm -f "${NEW_APP}" > /dev/null 2>&1 || true
+${DOCKER} run -d --name "${NEW_APP}" --network "${NET}" --restart unless-stopped \
+  --env-file "${ENV_FILE}" -v "${APP_NAME}-data:/app/data" --log-opt max-size=20m --log-opt max-file=5 \
   "${APP_NAME}:latest" > /dev/null
 
-echo "== 상태 확인(최대 3분)"
+echo "== 새 앱 상태 확인(최대 3분)"
+healthy=""
 for i in $(seq 1 36); do
-  if curl -fsS "http://127.0.0.1:${APP_PORT}/actuator/health" > /dev/null 2>&1; then
-    echo "앱이 켜졌어요: http://127.0.0.1:${APP_PORT} → https://${APP_DOMAIN}"
-    ${DOCKER} image prune -f > /dev/null 2>&1 || true
-    exit 0
-  fi
+  if ${DOCKER} exec "${NEW_APP}" curl -fsS http://127.0.0.1:8080/actuator/health > /dev/null 2>&1; then healthy=1; break; fi
   sleep 5
 done
-echo "앱이 3분 안에 켜지지 않았어요. 마지막 로그:" >&2
-${DOCKER} logs --tail 80 "${APP}" >&2 || true
-exit 1
+if [ -z "${healthy}" ]; then
+  echo "새 앱이 3분 안에 켜지지 않아 그대로 지우고 옛 버전(${ACTIVE:-없음})이 계속 서비스해요. 새 앱 마지막 로그:" >&2
+  ${DOCKER} logs --tail 80 "${NEW_APP}" >&2 || true
+  ${DOCKER} rm -f "${NEW_APP}" > /dev/null 2>&1 || true
+  exit 1
+fi
+
+echo "== 프록시를 ${NEXT}로 넘기기"
+# 디렉터리째 마운트한다(파일 하나만 마운트하면 mv로 바꾼 새 파일이 컨테이너에 안 보임)
+mkdir -p "${CONF_DIR}"
+cat > "${CONF_DIR}/default.conf.new" <<CONF
+# run-on-server.sh가 만든다. 지금 서비스하는 앱: ${NEXT}
+server {
+    listen 80;
+    client_max_body_size 12m;
+    # 도커 내부 DNS로 요청 때마다 찾는다(앱이 아직 안 떠도 프록시는 뜸)
+    resolver 127.0.0.11 valid=10s;
+    set \$app http://${NEW_APP}:8080;
+    location / {
+        proxy_pass \$app;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Forwarded-Proto \$http_x_forwarded_proto;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_read_timeout 120s;
+    }
+}
+CONF
+if [ -f "${CONF_DIR}/default.conf" ]; then cp "${CONF_DIR}/default.conf" "${CONF_DIR}/default.conf.old"; fi
+mv "${CONF_DIR}/default.conf.new" "${CONF_DIR}/default.conf"
+if [ "$(${DOCKER} inspect -f '{{.State.Running}}' "${PROXY}" 2>/dev/null)" = "true" ]; then
+  if ! { ${DOCKER} exec "${PROXY}" nginx -t > /dev/null 2>&1 && ${DOCKER} exec "${PROXY}" nginx -s reload > /dev/null; }; then
+    echo "프록시 설정을 바꾸지 못해 새 앱을 지우고 옛 버전을 그대로 둬요" >&2
+    if [ -f "${CONF_DIR}/default.conf.old" ]; then mv "${CONF_DIR}/default.conf.old" "${CONF_DIR}/default.conf"; fi
+    ${DOCKER} rm -f "${NEW_APP}" > /dev/null 2>&1 || true
+    exit 1
+  fi
+else
+  # 처음 한 번(옛 구조에서 옮길 때): APP_PORT를 쓰던 옛 앱을 내리고 프록시를 띄운다(이때만 몇 초 끊김)
+  ${DOCKER} rm -f "${LEGACY_APP}" "${PROXY}" > /dev/null 2>&1 || true
+  ${DOCKER} run -d --name "${PROXY}" --network "${NET}" --restart unless-stopped \
+    -p "${APP_PORT}:80" -v "${CONF_DIR}:/etc/nginx/conf.d:ro" --log-opt max-size=10m --log-opt max-file=3 \
+    "${PROXY_IMAGE}" > /dev/null
+fi
+
+echo "== 프록시로 확인"
+ok=""
+for i in $(seq 1 12); do
+  if curl -fsS "http://127.0.0.1:${APP_PORT}/actuator/health" > /dev/null 2>&1; then ok=1; break; fi
+  sleep 2
+done
+if [ -z "${ok}" ]; then
+  echo "프록시(${APP_PORT})로 앱에 닿지 않아요. 프록시 로그:" >&2
+  ${DOCKER} logs --tail 40 "${PROXY}" >&2 || true
+  exit 1
+fi
+# 옛 앱이 받던 요청이 끝나게 잠깐 두었다가 정상 종료(SIGTERM)로 끈다
+if [ -n "${ACTIVE}" ] && [ "${ACTIVE}" != "${NEXT}" ]; then
+  sleep 10
+  ${DOCKER} stop -t 30 "${APP_NAME}-app-${ACTIVE}" > /dev/null 2>&1 || true
+  ${DOCKER} rm -f "${APP_NAME}-app-${ACTIVE}" > /dev/null 2>&1 || true
+fi
+${DOCKER} rm -f "${LEGACY_APP}" > /dev/null 2>&1 || true
+${DOCKER} image prune -f > /dev/null 2>&1 || true
+echo "새 버전(${NEXT})이 서비스 중이에요: http://127.0.0.1:${APP_PORT} → https://${APP_DOMAIN}"
